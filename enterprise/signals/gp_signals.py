@@ -1076,35 +1076,29 @@ class MarginalizingNmat(object):
     def MNMMNF(self, T):
         return self.cf(self.MNF(T))
 
-    # we're ignoring logdet = True for two-dimensional cases, but OK
+    @signal_base.simplememobyid
+    def _project_basis(self, basis):
+        return basis - self.Mmat @ self.MNMMNF(basis)
+
+    def _project(self, array):
+        if array.ndim == 1:
+            return array - self.Mmat @ self.cf(self.MNr(array))
+        return self._project_basis(array)
+
+    # Preserve the convention that only the residual quadratic returns a logdet.
     def solve(self, right, left_array=None, logdet=False):
-        if right.ndim == 1 and left_array is right:
-            res = right
-
-            rNr, logdet_N = self.Nmat.solve(res, left_array=res, logdet=True)
-
-            MNr = self.MNr(res)
-            ret = rNr - np.dot(MNr, self.cf(MNr))
-            return (ret, logdet_N + self.cf.logdet() + self.Mprior) if logdet else ret
-        elif right.ndim == 1 and left_array is not None and left_array.ndim == 2:
-            res, T = right, left_array
-
-            TNr = self.Nmat.solve(res, left_array=T)
-            return TNr - np.tensordot(self.MNMMNF(T), self.MNr(res), (0, 0))
-        elif right.ndim == 2 and left_array is right:
-            T = right
-
-            TNT = self.Nmat.solve(T, left_array=T)
-            return TNT - np.tensordot(self.MNF(T), self.MNMMNF(T), (0, 0))
-        elif left_array is not None and right.ndim == left_array.ndim and right.ndim <= 2:
-            T = right
-            L = left_array
-
-            LNT = self.Nmat.solve(T, left_array=L)
-
-            return LNT - np.tensordot(self.MNF(L), self.MNMMNF(T), (0, 0))
-        else:
+        if right.ndim not in (1, 2) or left_array is None or left_array.ndim not in (1, 2):
             raise ValueError("Incorrect arguments given to MarginalizingNmat.solve.")
+
+        projected = self._project(right)
+        if left_array is right:
+            if right.ndim == 1 and logdet:
+                q, ld = self.Nmat.solve(projected, left_array=projected, logdet=True)
+                return q, ld + self.cf.logdet() + self.Mprior
+            left = projected
+        else:
+            left = self._project(left_array)
+        return self.Nmat.solve(projected, left_array=left)
 
     def sqrtsolve(self, other, left_array=None):
         if other.ndim == 1:

@@ -194,79 +194,82 @@ class LogLikelihood(object):
     def _block_TNr(self, TNrs):
         return np.concatenate(TNrs)
 
+    def _solve(self, sigma, rhs):
+        # Equilibrate units across timing and stochastic basis columns.
+        scale = np.sqrt(sigma.diagonal())
+        if not np.all(np.isfinite(scale) & (scale > 0)):
+            raise sl.LinAlgError("Invalid normal-matrix diagonal")
+        if sps.issparse(sigma):
+            inv_scale = sps.diags(1 / scale, format="csc")
+            scaled = inv_scale @ sigma @ inv_scale
+            if hasattr(self, "cf_sp"):
+                self.cf_sp.cholesky_inplace(scaled)
+            else:
+                self.cf_sp = cholesky(scaled)
+            cf = self.cf_sp
+            coefficients = cf(rhs / scale) / scale
+            logdet = cf.logdet()
+        else:
+            cf = sl.cho_factor(sigma / scale[:, None] / scale[None, :])
+            coefficients = sl.cho_solve(cf, rhs / scale) / scale
+            logdet = 2 * np.sum(np.log(np.diag(cf[0])))
+        return coefficients, logdet + 2 * np.sum(np.log(scale))
+
     def __call__(self, xs, phiinv_method="cliques"):
-        # map parameter vector if needed
         params = xs if isinstance(xs, dict) else self.pta.map_params(xs)
-
-        loglike = 0
-
-        # phiinvs will be a list or may be a big matrix if spatially
-        # correlated signals
         TNrs = self.pta.get_TNr(params)
         TNTs = self.pta.get_TNT(params)
         phiinvs = self.pta.get_phiinv(params, logdet=True, method=phiinv_method)
+        bases = self.pta.get_basis(params)
+        residuals = [sc.get_detres(params) for sc in self.pta._signalcollections]
+        noises = self.pta.get_ndiag(params)
+        quadratic = logdet_gp = 0.0
 
-        # get -0.5 * (rNr + logdet_N) piece of likelihood
-        # the np.sum here is needed because each pulsar returns a 2-tuple
-        loglike += -0.5 * np.sum([ell for ell in self.pta.get_rNr_logdet(params)])
-
-        # Add factors of log(2pi) for the likelihood normalization
-        ntot = sum(sc._residuals.size for sc in self.pta._signalcollections)
-        loglike -= 0.5 * ntot * np.log(2 * np.pi)
-
-        # get extra prior/likelihoods
-        loglike += sum(self.pta.get_logsignalprior(params))
-
-        # red noise piece
-        if self.pta._commonsignals:
-            phiinv, logdet_phi = phiinvs
-
-            TNT = self._block_TNT(TNTs)
-            TNr = self._block_TNr(TNrs)
-
-            if self.cholesky_sparse:
-                try:
-                    Sigma_sp = TNT + sps.csc_matrix(phiinv)
-
-                    if hasattr(self, "cf_sp"):
-                        # Have analytical decomposition already. Just do update
-                        self.cf_sp.cholesky_inplace(Sigma_sp)
-                    else:
-                        # Do analytical and numerical Sparse Cholesky
-                        self.cf_sp = cholesky(Sigma_sp)
-
-                    expval = self.cf_sp(TNr)
-                    logdet_sigma = self.cf_sp.logdet()
-                except CholmodError:  # pragma: no cover
-                    return -np.inf
+        # Evaluate the marginalized quadratic at the posterior mode a:
+        # (r - T a)^T N^-1 (r - T a) + a^T Phi^-1 a.
+        # Unlike r^T N^-1 r - (T^T N^-1 r)^T a, this does not subtract
+        # two large quadratic forms when the timing model fits closely.
+        try:
+            if self.pta._commonsignals:
+                precision, logdet_phi = phiinvs
+                if self.cholesky_sparse:
+                    precision = sps.csc_matrix(precision)
+                elif sps.issparse(precision):
+                    precision = precision.toarray()
+                else:
+                    precision = np.asarray(precision)
+                active = [i for i, t in enumerate(bases) if t is not None]
+                tnt = self._block_TNT(TNTs if len(active) == len(bases) else [TNTs[i] for i in active])
+                tnr = self._block_TNr(TNrs if len(active) == len(bases) else [TNrs[i] for i in active])
+                a, logdet_sigma = self._solve(tnt + precision, tnr)
+                quadratic += a @ (precision @ a)
+                logdet_gp += logdet_sigma + logdet_phi
+                boundaries = np.cumsum([bases[i].shape[1] for i in active])[:-1]
+                for i, coefficients in zip(active, np.split(a, boundaries)):
+                    residuals[i] = residuals[i] - bases[i] @ coefficients
             else:
-                try:
-                    cf = sl.cho_factor(TNT + phiinv)  # cf(Sigma)
-                    expval = sl.cho_solve(cf, TNr)
-                    logdet_sigma = 2 * np.sum(np.log(np.diag(cf[0])))
-                except sl.LinAlgError:  # pragma: no cover
-                    return -np.inf
+                for i, (tnr, tnt, prior) in enumerate(zip(TNrs, TNTs, phiinvs)):
+                    if tnr is None:
+                        continue
+                    precision, logdet_phi = prior
+                    sigma = tnt + (np.diag(precision) if precision.ndim == 1 else precision)
+                    a, logdet_sigma = self._solve(sigma, tnr)
+                    quadratic += a @ (precision * a if precision.ndim == 1 else precision @ a)
+                    logdet_gp += logdet_sigma + logdet_phi
+                    residuals[i] = residuals[i] - bases[i] @ a
+        except (sl.LinAlgError, CholmodError):
+            return -np.inf
 
-            loglike += 0.5 * (np.dot(TNr, expval) - logdet_sigma - logdet_phi)
-        else:
-            for TNr, TNT, pl in zip(TNrs, TNTs, phiinvs):
-                if TNr is None:
-                    continue
+        logdet_noise = 0.0
+        for noise, residual in zip(noises, residuals):
+            q, ld = noise.solve(residual, left_array=residual, logdet=True)
+            quadratic += q
+            logdet_noise += ld
 
-                phiinv, logdet_phi = pl
-                Sigma = TNT + (np.diag(phiinv) if phiinv.ndim == 1 else phiinv)
-
-                try:
-                    cf = sl.cho_factor(Sigma)
-                    expval = sl.cho_solve(cf, TNr)
-                except sl.LinAlgError:  # pragma: no cover
-                    return -np.inf
-
-                logdet_sigma = np.sum(2 * np.log(np.diag(cf[0])))
-
-                loglike += 0.5 * (np.dot(TNr, expval) - logdet_sigma - logdet_phi)
-
-        return loglike
+        ntot = sum(sc._residuals.size for sc in self.pta._signalcollections)
+        return sum(self.pta.get_logsignalprior(params)) - 0.5 * (
+            quadratic + logdet_noise + logdet_gp + ntot * np.log(2 * np.pi)
+        )
 
 
 class PTA(object):
